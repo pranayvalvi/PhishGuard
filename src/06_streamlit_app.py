@@ -4,15 +4,34 @@ import numpy as np
 import re
 import joblib
 import torch
+import sqlite3
 import nltk
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from scipy.sparse import hstack
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import os
+from datetime import datetime
 
 # --- Setup & Caching ---
-st.set_page_config(page_title="PhishGuard Detector", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="PhishGuard 2.0", page_icon="🛡️", layout="wide")
+
+def init_db():
+    conn = sqlite3.connect("phishguard.db")
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS scans
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  timestamp DATETIME,
+                  sender TEXT,
+                  subject TEXT,
+                  prediction TEXT,
+                  confidence REAL,
+                  risk_level TEXT,
+                  model_used TEXT)''')
+    conn.commit()
+    return conn
+
+conn = init_db()
 
 @st.cache_resource
 def load_nltk():
@@ -82,79 +101,142 @@ def clean_text(text):
     cleaned = " ".join([lemmatizer.lemmatize(w) for w in tokens if w not in stop_words])
     return cleaned
 
-# --- UI ---
-st.title("🛡️ PhishGuard: NLP Email Scam Detector")
-st.markdown("Analyze an email to determine if it is **Phishing (Scam)** or **Legitimate (Safe)**.")
+# --- UI Layout ---
+st.sidebar.title("🛡️ PhishGuard 2.0")
+page = st.sidebar.radio("Navigation", ["📊 Security Dashboard", "🔍 Manual Scanner"])
 
-st.sidebar.header("Model Selection")
-model_choice = st.sidebar.selectbox(
-    "Choose the NLP Model:",
-    ["Logistic Regression (TF-IDF)", "SVM (TF-IDF)", "Random Forest (TF-IDF + Metadata)", "DistilBERT (Contextual)"]
-)
-
-email_input = st.text_area("Paste the raw email content here:", height=250)
-
-if st.button("Analyze Email", type="primary"):
-    if not email_input.strip():
-        st.warning("Please paste an email to analyze.")
+if page == "📊 Security Dashboard":
+    st.title("📊 Security Dashboard")
+    
+    # Fetch stats from DB
+    df = pd.read_sql_query("SELECT * FROM scans ORDER BY timestamp DESC", conn)
+    
+    if df.empty:
+        st.info("No emails scanned yet. Use the Manual Scanner to get started!")
     else:
-        with st.spinner(f"Analyzing using {model_choice}..."):
-            # 1. Feature Extraction
-            meta = extract_metadata(email_input)
-            cleaned = clean_text(email_input)
+        total = len(df)
+        phishing = len(df[df['prediction'] == 'PHISHING'])
+        legit = len(df[df['prediction'] == 'LEGITIMATE'])
+        high_risk = len(df[df['risk_level'] == 'HIGH'])
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Scanned", total)
+        col2.metric("Phishing Detected", phishing)
+        col3.metric("Legitimate", legit)
+        col4.metric("High Risk Emails", high_risk)
+        
+        st.markdown("### 🕒 Recent Scans")
+        
+        # Formatting for UI
+        display_df = df[['timestamp', 'sender', 'subject', 'prediction', 'confidence', 'risk_level']].copy()
+        display_df['confidence'] = display_df['confidence'].apply(lambda x: f"{x:.2f}%")
+        
+        # Color coding
+        def color_risk(val):
+            color = 'red' if val == 'PHISHING' else 'green'
+            return f'color: {color}'
             
-            prediction = 0
-            confidence = 0.0
-            
-            # 2. Routing based on model choice
-            if "DistilBERT" in model_choice:
-                tokenizer, model = load_transformer()
-                inputs = tokenizer(email_input, return_tensors="pt", truncation=True, padding=True, max_length=256)
-                with torch.no_grad():
-                    outputs = model(**inputs)
-                    probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-                    prediction = torch.argmax(probs).item()
-                    confidence = probs[0][prediction].item() * 100
-            else:
-                tfidf, scaler, lr, svm, rf = load_classical_components()
-                X_tfidf = tfidf.transform([cleaned])
-                
-                if "Logistic" in model_choice:
-                    prediction = lr.predict(X_tfidf)[0]
-                    confidence = np.max(lr.predict_proba(X_tfidf)) * 100
-                elif "SVM" in model_choice:
-                    prediction = svm.predict(X_tfidf)[0]
-                    # Convert decision function to pseudo-probability
-                    score = svm.decision_function(X_tfidf)[0]
-                    prob = 1 / (1 + np.exp(-score))
-                    confidence = (prob if prediction == 1 else (1 - prob)) * 100
-                elif "Random Forest" in model_choice:
-                    meta_df = pd.DataFrame([meta])
-                    X_meta = scaler.transform(meta_df[['text_length', 'uppercase_ratio', 'exclamation_count', 'url_count', 'email_address_count', 'html_presence', 'urgency_word_count']])
-                    X_rf = hstack([X_tfidf, X_meta])
-                    prediction = rf.predict(X_rf)[0]
-                    confidence = np.max(rf.predict_proba(X_rf)) * 100
+        st.dataframe(display_df.style.map(color_risk, subset=['prediction']), use_container_width=True)
 
-            # 3. Display Results
-            st.markdown("---")
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("Prediction Result")
-                if prediction == 1:
-                    st.error("🚨 **PHISHING DETECTED** 🚨")
+elif page == "🔍 Manual Scanner":
+    st.title("🔍 Manual Email Scanner")
+    st.markdown("Analyze an email and store the result in the local security database.")
+
+    st.sidebar.header("Scanner Settings")
+    model_choice = st.sidebar.selectbox(
+        "Choose the NLP Model:",
+        ["Logistic Regression (TF-IDF)", "SVM (TF-IDF)", "Random Forest (TF-IDF + Metadata)", "DistilBERT (Contextual)"]
+    )
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        sender_input = st.text_input("Sender Email (Optional):", value="unknown@example.com")
+    with col2:
+        subject_input = st.text_input("Subject (Optional):", value="No Subject")
+
+    email_input = st.text_area("Paste the raw email content here:", height=200)
+
+    if st.button("Analyze & Log Email", type="primary"):
+        if not email_input.strip():
+            st.warning("Please paste an email to analyze.")
+        else:
+            with st.spinner(f"Analyzing using {model_choice}..."):
+                # 1. Feature Extraction
+                meta = extract_metadata(email_input)
+                cleaned = clean_text(email_input)
+                
+                prediction_val = 0
+                confidence = 0.0
+                
+                # 2. Routing based on model choice
+                if "DistilBERT" in model_choice:
+                    tokenizer, model = load_transformer()
+                    inputs = tokenizer(email_input, return_tensors="pt", truncation=True, padding=True, max_length=256)
+                    with torch.no_grad():
+                        outputs = model(**inputs)
+                        probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+                        prediction_val = torch.argmax(probs).item()
+                        confidence = probs[0][prediction_val].item() * 100
                 else:
-                    st.success("✅ **LEGITIMATE EMAIL** ✅")
+                    tfidf, scaler, lr, svm, rf = load_classical_components()
+                    X_tfidf = tfidf.transform([cleaned])
                     
-                st.metric(label="Model Confidence", value=f"{confidence:.2f}%")
+                    if "Logistic" in model_choice:
+                        prediction_val = lr.predict(X_tfidf)[0]
+                        confidence = np.max(lr.predict_proba(X_tfidf)) * 100
+                    elif "SVM" in model_choice:
+                        prediction_val = svm.predict(X_tfidf)[0]
+                        score = svm.decision_function(X_tfidf)[0]
+                        prob = 1 / (1 + np.exp(-score))
+                        confidence = (prob if prediction_val == 1 else (1 - prob)) * 100
+                    elif "Random Forest" in model_choice:
+                        meta_df = pd.DataFrame([meta])
+                        X_meta = scaler.transform(meta_df[['text_length', 'uppercase_ratio', 'exclamation_count', 'url_count', 'email_address_count', 'html_presence', 'urgency_word_count']])
+                        X_rf = hstack([X_tfidf, X_meta])
+                        prediction_val = rf.predict(X_rf)[0]
+                        confidence = np.max(rf.predict_proba(X_rf)) * 100
 
-            with col2:
-                st.subheader("Extracted Indicators")
-                st.markdown(f"- **URLs Found:** {meta['url_count']}")
-                st.markdown(f"- **HTML Detected:** {'Yes' if meta['html_presence'] else 'No'}")
-                st.markdown(f"- **Urgency Words:** {meta['urgency_word_count']}")
-                st.markdown(f"- **Exclamation Marks:** {meta['exclamation_count']}")
-                st.markdown(f"- **Uppercase Ratio:** {meta['uppercase_ratio']*100:.1f}%")
+                # 3. Calculate Risk Score
+                prediction_str = "PHISHING" if prediction_val == 1 else "LEGITIMATE"
                 
-            with st.expander("View Cleaned Text (For Classical Models)"):
-                st.write(cleaned)
+                # Boost risk if URLs + Urgency are present
+                risk_score = confidence if prediction_val == 1 else (100 - confidence)
+                if meta['url_count'] > 0 and meta['urgency_word_count'] > 0:
+                    risk_score = min(100, risk_score + 15)
+                
+                risk_level = "LOW"
+                if risk_score > 85 and prediction_val == 1:
+                    risk_level = "HIGH"
+                elif risk_score > 60 and prediction_val == 1:
+                    risk_level = "MEDIUM"
+
+                # 4. Save to Database
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                c = conn.cursor()
+                c.execute('''INSERT INTO scans (timestamp, sender, subject, prediction, confidence, risk_level, model_used)
+                             VALUES (?, ?, ?, ?, ?, ?, ?)''', 
+                          (timestamp, sender_input, subject_input, prediction_str, risk_score, risk_level, model_choice))
+                conn.commit()
+
+                # 5. Display Results
+                st.markdown("---")
+                col_res1, col_res2 = st.columns(2)
+                
+                with col_res1:
+                    st.subheader("Classification Result")
+                    if prediction_val == 1:
+                        st.error(f"🚨 **{prediction_str}** 🚨")
+                        st.warning(f"**Risk Level:** {risk_level}")
+                    else:
+                        st.success(f"✅ **{prediction_str}** ✅")
+                        st.info(f"**Risk Level:** {risk_level}")
+                        
+                    st.metric(label="Calculated Risk Score", value=f"{risk_score:.2f}/100")
+
+                with col_res2:
+                    st.subheader("Detected Indicators")
+                    st.markdown(f"- **URLs Found:** {meta['url_count']}")
+                    st.markdown(f"- **HTML Detected:** {'Yes' if meta['html_presence'] else 'No'}")
+                    st.markdown(f"- **Urgency Words:** {meta['urgency_word_count']}")
+                    st.markdown(f"- **Exclamation Marks:** {meta['exclamation_count']}")
+                    st.markdown(f"- **Uppercase Ratio:** {meta['uppercase_ratio']*100:.1f}%")
