@@ -1,0 +1,22 @@
+# Python environments
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Data files (Too large for Git)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Models (Binaries are too large for Git)
+models/*.joblib
+models/distilbert_model/
+models/results/
+!models/confusion_matrices.png
+!models/evaluation_metrics.csv
+
+# OS generated files
+.DS_Store
+Thumbs.db
